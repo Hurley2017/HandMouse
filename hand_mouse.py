@@ -92,19 +92,19 @@ class HandGestureDetector:
     def process_frame(self, frame, hand_landmarks):
         """Process frame and detect gestures"""
         # Get key landmark points (hand_landmarks is a list of NormalizedLandmark objects)
-        index_tip = hand_landmarks[8]   # Index finger tip
-        index_pip = hand_landmarks[6]   # Index finger PIP
-        middle_tip = hand_landmarks[12]  # Middle finger tip
-        middle_pip = hand_landmarks[10]  # Middle finger PIP
+        # Swapped: 12 for index tip, 10 for index PIP, 8 for middle tip, 6 for middle PIP
+        index_tip = hand_landmarks[12]  # Index finger tip (swapped)
+        index_pip = hand_landmarks[10]  # Index finger PIP (swapped)
+        middle_tip = hand_landmarks[8]   # Middle finger tip (swapped)
+        middle_pip = hand_landmarks[6]   # Middle finger PIP (swapped)
         
         # Convert to pixel coordinates
         index_tip_pos = (index_tip.x, index_tip.y)
         middle_tip_pos = (middle_tip.x, middle_tip.y)
         
-        # Map hand position to screen (with some adjustments for natural movement)
-        # Invert x-axis so right hand movement matches screen movement
-        screen_x = (1 - index_tip.x) * screen_width
-        screen_y = index_tip.y * screen_height
+        # Map hand position to screen - direct mapping (not inverted)
+        screen_x = index_tip.x * screen_width
+        screen_y = (1 - index_tip.y) * screen_height  # Invert Y-axis for correct up/down mapping
         
         # Move mouse to detected position
         pyautogui.moveTo(int(screen_x), int(screen_y), duration=0.01)
@@ -129,10 +129,10 @@ def main():
         print("Error: Cannot access camera")
         return
     
-    # Set camera resolution for better performance
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
     cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
     detector = HandGestureDetector()
     
@@ -155,28 +155,31 @@ def main():
         frame = cv2.flip(frame, 1)
         h, w, c = frame.shape
         
-        # Convert to RGB for MediaPipe
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Convert to grayscale for faster processing and display
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Convert grayscale back to 3 channels for mediapipe (it will work with grayscale data)
+        rgb_frame = cv2.cvtColor(gray_frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         
         # Detect hand landmarks
         detection_result = detector.landmarker.detect(mp_image)
         
-        # Draw hand landmarks and process gestures
+        # Draw hand landmarks on grayscale frame
         if detection_result.hand_landmarks:
             for hand_landmarks in detection_result.hand_landmarks:
-                # Draw hand landmarks
-                h_img, w_img, c_img = frame.shape
+                # Draw hand landmarks (white dots on grayscale)
+                h_img, w_img = gray_frame.shape
                 for landmark in hand_landmarks:
                     x = int(landmark.x * w_img)
                     y = int(landmark.y * h_img)
-                    cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+                    cv2.circle(gray_frame, (x, y), 2, 255, -1)  # White dots
                 
                 # Process frame for gestures and mouse movement
-                detector.process_frame(frame, hand_landmarks)
+                detector.process_frame(gray_frame, hand_landmarks)
         
-        # Display frame
-        cv2.imshow('Hand Mouse Control', frame)
+        # Display grayscale frame
+        display_frame = cv2.resize(gray_frame, (320, 240))
+        cv2.imshow('Hand Mouse Control', display_frame)
         
         # Check for quit
         key = cv2.waitKey(1) & 0xFF
