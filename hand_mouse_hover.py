@@ -11,28 +11,31 @@ import urllib.request
 import threading
 import sounddevice as sd
 
-# --- CONFIGURATION (TUNE THESE!) ---
+# --- CONFIGURATION (HIGH SENSITIVITY) ---
 class Config:
     CAM_WIDTH, CAM_HEIGHT = 640, 480
     FPS = 60 
     
     # --- DIRECTION CORRECTION ---
-    # If mouse moves opposite to hand, change 1 to -1
-    DIR_X = -1  # Try 1 or -1
-    DIR_Y = -1  # Try 1 or -1
+    # Change these to -1 if mouse moves opposite to hand
+    DIR_X = 1 
+    DIR_Y = 1 
     
-    # --- SENSITIVITY ---
-    # How fast the mouse moves relative to hand speed
-    SPEED_MULTIPLIER = 3.0
+    # --- SPEED ---
+    SPEED_MULTIPLIER = 5.0 # Increased for snappier movement
     
-    # --- AUDIO THRESHOLDS (CHECK CONSOLE FOR VALUES) ---
-    SLIDE_THRESHOLD = 0.5  # Hiss volume
-    TAP_THRESHOLD = 8.0    # Thud volume
+    # --- AUDIO THRESHOLDS (Aggressive) ---
+    # SLIDE: Volume needed to MOVE (Hissing)
+    # 0.08 is very sensitive. If cursor drifts, raise to 0.12
+    SLIDE_THRESHOLD = 0.08   
+    
+    # TAP: Volume needed to CLICK (Thud)
+    # 1.5 is very low. A light tap is enough.
+    TAP_THRESHOLD = 1.5     
     
     # --- PHYSICS ---
-    MOVEMENT_DEADZONE = 0.002 # Normalized distance (very small)
-    SMOOTHING = 5.0       
-    TAP_COOLDOWN = 0.4
+    MOVEMENT_DEADZONE = 0.002 
+    TAP_COOLDOWN = 0.25 # Reduced cooldown for faster clicking
 
 pyautogui.FAILSAFE = False 
 pyautogui.PAUSE = 0 
@@ -45,20 +48,33 @@ class AudioEngine:
         self.is_tapping = False
         self.current_volume = 0.0
         self.stream = None
+        
+        # Dynamic Noise Floor Calibration
+        self.background_noise = 0.0
+        self.calibration_samples = []
 
     def audio_callback(self, indata, frames, time, status):
-        # Calculate Volume (Simple Norm)
+        # Calculate Volume
         vol = np.linalg.norm(indata) * 10
         self.current_volume = vol
         
-        # DEBUG: Uncomment to see volume in console live
-        # print(f"VOL: {vol:.2f}") 
+        # Calibration Phase (First 50 samples)
+        if len(self.calibration_samples) < 50:
+            self.calibration_samples.append(vol)
+            return
+
+        # Calculate Logic
+        # We check relative to background noise if calibrated
+        floor = np.mean(self.calibration_samples)
         
-        # LOGIC
+        # TAP LOGIC (Priority)
         if vol > Config.TAP_THRESHOLD:
             self.is_tapping = True
-            self.is_sliding = True
-        elif vol > Config.SLIDE_THRESHOLD:
+            self.is_sliding = True # Tap includes contact
+        
+        # SLIDE LOGIC
+        # Must be louder than floor AND louder than threshold
+        elif vol > (floor + Config.SLIDE_THRESHOLD):
             self.is_sliding = True
             self.is_tapping = False
         else:
@@ -74,7 +90,9 @@ class AudioEngine:
                 blocksize=1024
             )
             self.stream.start()
-            print("--- MIC LISTENING ---")
+            print("--- CALIBRATING MIC (Please remain silent for 1 second)... ---")
+            time.sleep(1.0)
+            print("--- READY! ---")
         except Exception as e:
             print(f"MIC ERROR: {e}")
 
@@ -99,18 +117,13 @@ class HandController:
         )
         self.landmarker = vision.HandLandmarker.create_from_options(options)
         
-        # Audio
+        # Start Audio
         self.audio = AudioEngine()
         self.audio.start()
         
-        # Relative Tracking State
-        self.prev_hand_x = 0
-        self.prev_hand_y = 0
-        
-        # Mouse State
-        curr_x, curr_y = pyautogui.position()
-        self.mouse_x, self.mouse_y = curr_x, curr_y
-        
+        # Physics State
+        self.target_hand_x = 0.5
+        self.target_hand_y = 0.5
         self.running = True
 
     def _ensure_model_downloaded(self):
@@ -132,42 +145,34 @@ class HandController:
             success, frame = cap.read()
             if not success: continue
             
-            # 1. Flip frame for user comfort (Mirror)
             frame = cv2.flip(frame, 1)
-            
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            timestamp = int((time.time() - start_time) * 1000)
             
+            timestamp = int((time.time() - start_time) * 1000)
             result = self.landmarker.detect_for_video(mp_image, timestamp)
             
             if result.hand_landmarks:
-                # Raw Normalized Coordinates (0.0 to 1.0)
                 idx_tip = result.hand_landmarks[0][8]
-                
-                # We simply store the raw hand position here.
-                # The logic happens in mouse_worker to ensure smooth deltas.
                 self.target_hand_x = idx_tip.x
                 self.target_hand_y = idx_tip.y
                 
                 # Visuals
-                color = (0, 255, 0) if self.audio.is_sliding else (0, 0, 255)
-                if self.audio.is_tapping: color = (0, 255, 255)
+                color = (0, 0, 255) # Red = Idle
+                if self.audio.is_sliding: color = (0, 255, 0) # Green = Moving
+                if self.audio.is_tapping: color = (0, 255, 255) # Yellow = Click
                 
                 cx, cy = int(idx_tip.x * Config.CAM_WIDTH), int(idx_tip.y * Config.CAM_HEIGHT)
-                cv2.circle(frame, (cx, cy), 8, color, -1)
+                cv2.circle(frame, (cx, cy), 10, color, -1)
             
-            # HUD
+            # HUD (Sensitive Bar)
             vol = self.audio.current_volume
-            # Dynamic Bar color
-            bar_col = (0, 255, 0)
-            if vol > Config.TAP_THRESHOLD: bar_col = (0, 0, 255)
-            elif vol > Config.SLIDE_THRESHOLD: bar_col = (255, 255, 0)
+            # Scale up significantly so small sounds are visible
+            bar_len = int(vol * 50) 
+            cv2.rectangle(frame, (50, 400), (50 + bar_len, 420), (255, 255, 0), -1)
+            cv2.putText(frame, f"Vol: {vol:.3f}", (50, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            cv2.rectangle(frame, (50, 400), (50 + int(vol * 20), 420), bar_col, -1)
-            cv2.putText(frame, f"Vol: {vol:.2f}", (50, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            cv2.imshow("Delta Mouse", frame)
+            cv2.imshow("Sensitive Acoustic Mouse", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.running = False
                 break
@@ -177,72 +182,58 @@ class HandController:
         self.audio.stop()
 
     def mouse_worker(self):
-        last_tap = 0
+        # Initial wait for vision data
+        time.sleep(1.0)
         
-        # Initialize Previous Hand Position
-        # We need a brief moment to get the first frame data
-        time.sleep(1) 
-        try:
-            prev_hx = self.target_hand_x
-            prev_hy = self.target_hand_y
-        except:
-            prev_hx, prev_hy = 0.5, 0.5
-            
+        prev_hx = self.target_hand_x
+        prev_hy = self.target_hand_y
+        last_tap_time = 0
+        
         while self.running:
-            try:
-                curr_hx = self.target_hand_x
-                curr_hy = self.target_hand_y
-            except:
-                continue # No hand detected yet
-
-            # 1. MOVEMENT (RELATIVE DELTA)
+            curr_hx = self.target_hand_x
+            curr_hy = self.target_hand_y
+            
+            # 1. MOVEMENT (Gated by Audio)
             if self.audio.is_sliding and not self.audio.is_tapping:
-                # Calculate Delta (How much did hand move?)
+                # Calculate Delta
                 dx = curr_hx - prev_hx
                 dy = curr_hy - prev_hy
                 
-                # Apply Deadzone (Ignore tiny jitter)
                 if abs(dx) > Config.MOVEMENT_DEADZONE or abs(dy) > Config.MOVEMENT_DEADZONE:
-                    
                     # Apply Speed & Direction
-                    # Map normalized delta to screen pixels
                     move_x = dx * screen_w * Config.SPEED_MULTIPLIER * Config.DIR_X
                     move_y = dy * screen_h * Config.SPEED_MULTIPLIER * Config.DIR_Y
                     
-                    # Move Relative to CURRENT mouse position
                     pyautogui.moveRel(move_x, move_y, _pause=False)
                 
-                # Update "Previous" to "Current" so we don't drift
+                # Update Prev to Current
                 prev_hx = curr_hx
                 prev_hy = curr_hy
                 
             else:
-                # CLUTCH MODE (Silence)
-                # We update prev_hx/hy continuously even when not moving mouse.
-                # This ensures that when you start moving again, 
-                # the delta is calculated from where your hand IS, not where it WAS.
-                # This fixes the "Snap Back" glitch.
+                # CLUTCH MODE (Sync Position)
+                # When silent, we keep updating prev to curr,
+                # so the delta is 0 until we start making noise again.
                 prev_hx = curr_hx
                 prev_hy = curr_hy
                 
-                # Debug print for Thud tuning
+                # Debug print for Tap Tuning
                 if self.audio.current_volume > 1.0:
-                    print(f"LOUD NOISE: {self.audio.current_volume:.2f}")
+                    print(f"NOISE PEAK: {self.audio.current_volume:.2f}")
 
             # 2. CLICK
             if self.audio.is_tapping:
-                if time.time() - last_tap > Config.TAP_COOLDOWN:
-                    print(f"CLICK! (Vol: {self.audio.current_volume:.2f})")
+                if time.time() - last_tap_time > Config.TAP_COOLDOWN:
+                    print("--- CLICK FIRED ---")
                     pyautogui.click()
-                    last_tap = time.time()
+                    last_tap_time = time.time()
             
-            time.sleep(0.01) # 100Hz is enough for relative
+            time.sleep(0.01)
 
 def main():
-    print("--- DELTA MOUSE STARTED ---")
-    print("1. Hiss/Slide -> Moves relative to current position")
-    print("2. Thud -> Click")
-    print("3. Check Console for Volume numbers!")
+    print("--- HIGH SENSITIVITY MOUSE ---")
+    print("1. Slide lightly (Hiss) -> Move")
+    print("2. Tap lightly (Thud) -> Click")
     
     controller = HandController()
     t1 = threading.Thread(target=controller.vision_worker)
